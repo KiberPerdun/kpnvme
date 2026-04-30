@@ -126,7 +126,7 @@ kpnvme_probe (struct pci_dev *pdev, const struct pci_device_id *id)
   struct nvme_command cmd = {
     .identify = {
         .opcode = nvme_admin_identify,
-        .command_id = cmd_id++,
+        .command_id = cmd_id,
         .nsid = 0,
         .cns = NVME_ID_CNS_CTRL,
         .dptr = {
@@ -228,18 +228,30 @@ kpnvme_probe (struct pci_dev *pdev, const struct pci_device_id *id)
 
   s32 nvecs = pci_alloc_irq_vectors_affinity (pdev,
                                           1,
-                                          nr_io_queues,
+                                          nr_io_queues + 1,
                                           PCI_IRQ_MSIX | PCI_IRQ_AFFINITY,
                                           &affd);
   if (nvecs < 0)
     return nvecs;
 
   dev->io_queues = min_t (u16, nr_io_queues, nvecs - 1);
+
   dev->queues = devm_kcalloc (&pdev->dev, dev->io_queues + 1,
                               sizeof (*dev->queues), GFP_KERNEL);
 
-  if (dev->queues)
+  if (!dev->queues)
     return -ENOMEM;
+
+  struct nvme_command __maybe_unused cmd_cq = {
+    .create_cq = {
+        .opcode = nvme_admin_create_cq,
+        .command_id = cmd_id++,
+        .cqid = cpu_to_le16 (dev->cq.qid),
+        .qsize = cpu_to_le16 (dev->cq.depth - 1),
+        .cq_flags = cpu_to_le16 (NVME_CQ_IRQ_ENABLED | NVME_QUEUE_PHYS_CONTIG),
+        .irq_vector = cpu_to_le16 (dev->queues[1].vector), /* irq сюды */
+    }
+  };
 
   dev->queues[0].qid = 0;
   dev->queues[0].vector = 0;
@@ -256,18 +268,47 @@ kpnvme_probe (struct pci_dev *pdev, const struct pci_device_id *id)
 
       mask = pci_irq_get_affinity (pdev, qid);
       q->cpu = mask ? cpumask_first (mask) : -1;
-    }
 
-  struct nvme_command __maybe_unused cmd_cq = {
-    .create_cq = {
-        .opcode = nvme_admin_create_cq,
-        .command_id = cmd_id++,
-        .cqid = cpu_to_le16 (dev->cq.qid),
-        .qsize = cpu_to_le16 (dev->cq.depth - 1),
-        .cq_flags = cpu_to_le16 (NVME_CQ_IRQ_ENABLED),
-        .irq_vector = cpu_to_le16 (dev->queues[1].vector),
+      q->vaddr = dmam_alloc_coherent (&pdev->dev, dev->cq.depth * dev->cqe_size,
+                                      &q->dma, GFP_KERNEL);
+
+      cmd_cq.create_cq.command_id = le16_to_cpu (qid);
+      cmd_cq.create_cq.irq_vector = cpu_to_le16 (q->vector);
+      cmd_cq.create_cq.cqid = cpu_to_le16 (qid);
+      cmd_cq.create_cq.prp1 = cpu_to_le64 (q->dma);
+
+      dev->sq.vaddr[dev->sq.tail] = cmd_cq;
+      dev->sq.tail = (dev->sq.tail + 1) % dev->sq.depth;
+      wmb ();
+
+      writel (dev->sq.tail, dev->sq.db);
+
+      cqe = &((struct nvme_completion *)dev->cq.vaddr)[dev->cq.head];
+
+      while ((le16_to_cpu (READ_ONCE (cqe->status)) & 1) != dev->cq.phase)
+        cpu_relax ();
+
+      rmb ();
+
+      status = le16_to_cpu (READ_ONCE (cqe->status)) >> 1;
+      command_id = le16_to_cpu (READ_ONCE (cqe->command_id));
+      sq_head  = le16_to_cpu (cqe->sq_head);
+      if (status)
+        dev_err (&pdev->dev, "create cq failed, status=0x%04x\n", status);
+
+      if (command_id != qid)
+        dev_err (&pdev->dev, "create cq failed, command_id=0x%04x\n", command_id);
+
+      dev_info (&pdev->dev, "kpnvme: CQ CREATED CPU=%d, QID=%d\n", q->cpu, qid);
+
+      ++dev->cq.head;
+      if (dev->cq.head == dev->cq.depth)
+        {
+          dev->cq.head  = 0;
+          dev->cq.phase ^= 1;
+        }
+      writel (dev->cq.head, dev->cq.db);
     }
-  };
 
   dev->pdev = pdev;
   dev->bar = bar;
