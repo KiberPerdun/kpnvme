@@ -1,5 +1,34 @@
 #include "NVMe.h"
 
+static int
+kpnvme_init_hctx (struct blk_mq_hw_ctx *hctx, void *data, unsigned int idx)
+{
+  hctx->driver_data = data;
+  return 0;
+}
+
+static blk_status_t
+kpnvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+                 const struct blk_mq_queue_data *bd)
+{
+  struct request *rq = bd->rq;
+
+  blk_mq_start_request(rq);
+  blk_mq_end_request(rq, BLK_STS_IOERR);
+
+  return BLK_STS_OK;
+}
+
+static const struct blk_mq_ops kpnvme_mq_ops = {
+  .queue_rq = kpnvme_queue_rq,
+  .init_hctx = kpnvme_init_hctx,
+};
+
+static const struct block_device_operations kpnvme_fops = {
+  .owner = THIS_MODULE,
+};
+
+
 static s32
 kpnvme_probe (struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -313,6 +342,44 @@ kpnvme_probe (struct pci_dev *pdev, const struct pci_device_id *id)
   dev->pdev = pdev;
   dev->bar = bar;
   dev_info (&pdev->dev, "kpnvme: BAR0=%pK IRQ=%d\n", dev->bar, dev->irq);
+  /* blk-mq initialization */
+  /* Для тестов пока что константы */
+  struct queue_limits lim = {
+    .logical_block_size = 4096,
+    .physical_block_size = 4096,
+    .max_hw_sectors = 256,
+    .dma_alignment = 3,
+  };
+
+  memset (&dev->tag_set, 0, sizeof (dev->tag_set));
+  dev->tag_set.ops = &kpnvme_mq_ops;
+  dev->tag_set.nr_hw_queues = dev->io_queues;
+  dev->tag_set.queue_depth = 64;
+  dev->tag_set.numa_node = NUMA_NO_NODE;
+  dev->tag_set.cmd_size = sizeof (struct nvme_command);
+  dev->tag_set.driver_data = dev;
+
+  ret = blk_mq_alloc_tag_set (&dev->tag_set);
+  if (ret)
+    return ret;
+
+  dev->disk = blk_mq_alloc_disk (&dev->tag_set, &lim, dev);
+
+  dev->disk->major = major;
+  dev->disk->first_minor = 0;
+  dev->disk->minors = 1;
+  dev->disk->fops = &kpnvme_fops;
+
+  snprintf (dev->disk->disk_name, DISK_NAME_LEN, "kpnvme0");
+  set_capacity (dev->disk, 1024 * 1024); /* 512 MiB */
+
+  ret = add_disk(dev->disk);
+  if (ret)
+    {
+      put_disk (dev->disk);
+      blk_mq_free_tag_set (&dev->tag_set);
+      return ret;
+    }
 
   struct kpnvme_dev *out = no_free_ptr (dev);
   void __iomem *bar_kept __maybe_unused = no_free_ptr (bar);

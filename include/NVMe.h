@@ -27,7 +27,7 @@ static   s32 major __maybe_unused;
 DEFINE_FREE (kpnvme_iounmap, void __iomem *,
              if (_T) iounmap(_T))
 
-DEFINE_FREE (kpnvme_pci_disable_device, struct pci_dev *,
+DEFINE_FREE (kpnvme_pci_disable_device  , struct pci_dev *,
              if (_T) pci_disable_device (_T))
 
 DEFINE_FREE (kpnvme_pci_release_regions, struct pci_dev *,
@@ -62,6 +62,8 @@ struct kpnvme_dev
   struct pci_dev *pdev;
   void __iomem *bar;
   struct kpnvme_queue *queues;
+  struct gendisk *disk;
+  struct blk_mq_tag_set tag_set;
   __u32 mqes;
   __s32 irq;
   /* Размера слота в очереди 3:0 */
